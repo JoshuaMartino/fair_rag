@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+torch
+transformers>=4.40
+sentence-transformers
+faiss-cpu 
+faiss-gpu
+bm25s
+datasets
+tqdm
+pytest
