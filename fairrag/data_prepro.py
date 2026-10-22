@@ -48,9 +48,24 @@ def preprocess_bias_in_bios(old_folder_path, new_folder_path,mapping_path):
     df=None
     for split in splits:
         df = pd.read_csv(old_folder_path + f"/bias_in_bios_{split}.csv")
+        
         df = df.merge(mapping,on="profession", how='left' )
+     
+       
         df.rename(columns={'Unnamed: 0': 'bio_id', 'profession': 'profession_id', 'profession_name': 'profession', 'hard_text': 'bio'}, inplace=True)
-        df_24_occ = df[~df['profession'].isin(mapping['profession_name'])].copy()
+       
+        df_24_occ = df[df['profession'].isin(mapping['profession_name'])].copy()
+        
         df_24_occ["gender_string"] = df_24_occ["gender"].map({0: "male", 1: "female"})
         df_24_occ.to_csv(new_folder_path + f"/bias_in_bios_{split}.csv", index=False)
     return df
+
+def main():
+    new_folder = "datasets/b_in_b/"
+    mapping_path = "datasets/occupation mapping.csv"
+    old_folder = "datasets/"
+    test = preprocess_bias_in_bios(old_folder_path=old_folder, new_folder_path=new_folder, mapping_path=mapping_path)
+
+if __name__ == '__main__':
+    main()
+

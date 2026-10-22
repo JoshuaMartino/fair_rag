@@ -4,11 +4,11 @@ import pandas as pd
 
 def load_bias_in_bios(split):
     """LabHC/bias_in_bios: hard_text, profession (ClassLabel), gender (0=male, 1=female)."""
-    df = pd.read_csv(f"datasets/bias_in_bios_{split}.csv")
+    df = pd.read_csv(f"datasets/b_in_b/bias_in_bios_{split}.csv")
     return df
 
 def load_wiki_24(file_path):
-    df = pd.read_pickle(file_path)
+    df = pd.read_csv(file_path)
     return df
 
 def populate_test_collection(b_in_b, folder_path):
@@ -74,5 +74,14 @@ def populate_train_collection(b_in_b, folder_path):
     output_path = Path(folder_path)/"train.csv"
     shuffled_train_samples.to_csv(output_path, index=False)
     return shuffled_train_samples
+
+def main():
+    b_in_b = load_bias_in_bios("train")
+    path = "datasets/occupations/"
+    test = populate_test_collection(b_in_b=b_in_b, folder_path=path)
+
+if __name__ =="__main__":
+    main()
+
 
 

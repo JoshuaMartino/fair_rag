@@ -26,15 +26,14 @@ def load_dense_index(index_path="wiki_people"):
 
 
 def create_sparse_index(wiki_df, save_path):
-    docs = [Document(content=row["text"], meta = {"gender":row["gender"], "title":row["title"], "occupation":row["occupation"]}) for _, row in wiki_df.iterrows()]
+    docs = [Document(content=row["text"], meta = {"gender":row["gender"], "name":row["name"], "occupation":row["occupation"]}) for _, row in wiki_df.iterrows()]
     document_store = InMemoryDocumentStore(bm25_algorithm="BM25Okapi")
 
     document_store.write_documents(docs)
-    with open(save_path, "wb") as f:
-        pickle.dump(document_store, f)
+    document_store.save_to_disk(save_path)
     return document_store
 
 def load_sparse_index(save_path):
-    with open(save_path, "rb") as f:
-        document_store = pickle.load(f)
-    return document_store
+    docs = InMemoryDocumentStore.load_from_disk(save_path)
+    return docs
+
