@@ -1,2 +1,8 @@
 datasets/
 .DS_Store
+results/
+models/
+__pycache__/
+.pytest_cache/
+*.faiss
+wiki_people.json

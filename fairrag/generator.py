@@ -3,25 +3,39 @@
 This module connects:
     prompt.py -> Hugging Face model -> raw candidate scores -> CGLC
 
-The public method is ``generate``. It accepts the already-built prompt, a
-loaded or saved CGLC calibrator, and a model. The three occupation choices are
-read from the prompt unless supplied explicitly.
+Both decoder-only models (Gemma, Llama 2, DeepSeek, Falcon) and
+encoder-decoder models (Flan-T5) are supported. The class "logits" are the
+log-probabilities the model assigns to each of the three candidate
+occupation strings.
+
+``score_candidates`` is the method the experiment runner uses. ``generate``
+scores one prompt and applies a CGLC calibrator.
 """
 
 from __future__ import annotations
 
+import copy
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+)
 
 from calibration import ConfidenceGatedLogitCalibrator
+from prompt import display_label
 
 
 _OPTION_PATTERN = re.compile(r"^\s*-\s*(.+?)\s*$", re.MULTILINE)
+
+VALID_SCORE_MODES = {"first_token", "sum_logprob", "mean_logprob"}
 
 
 def extract_candidates_from_prompt(prompt: str) -> tuple[str, str, str]:
@@ -40,6 +54,10 @@ def extract_candidates_from_prompt(prompt: str) -> tuple[str, str, str]:
     return candidates
 
 
+def is_encoder_decoder(model: Any) -> bool:
+    return bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
+
+
 def _resolve_model_and_tokenizer(
     model: str | Any,
     tokenizer: Any | None,
@@ -47,7 +65,7 @@ def _resolve_model_and_tokenizer(
     torch_dtype: torch.dtype | str | None,
     trust_remote_code: bool,
 ) -> tuple[Any, Any, torch.device]:
-    """Accept a model name or an already-loaded causal language model."""
+    """Accept a model name or an already-loaded language model."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     resolved_device = torch.device(device)
@@ -75,13 +93,23 @@ def _resolve_model_and_tokenizer(
                 trust_remote_code=trust_remote_code,
             )
 
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+        )
+        model_class = (
+            AutoModelForSeq2SeqLM
+            if getattr(config, "is_encoder_decoder", False)
+            else AutoModelForCausalLM
+        )
+
         model_kwargs = {
             "trust_remote_code": trust_remote_code,
         }
         if torch_dtype is not None:
             model_kwargs["torch_dtype"] = torch_dtype
 
-        model = AutoModelForCausalLM.from_pretrained(
+        model = model_class.from_pretrained(
             model_name,
             **model_kwargs,
         )
@@ -102,7 +130,233 @@ def _resolve_model_and_tokenizer(
     return model, tokenizer, resolved_device
 
 
+def load_model(
+    model: str | Any,
+    tokenizer: Any | None = None,
+    device: str | None = None,
+    torch_dtype: torch.dtype | str | None = None,
+    trust_remote_code: bool = False,
+) -> tuple[Any, Any, torch.device]:
+    """Load (or pass through) a model and tokenizer, moved to the device."""
+    return _resolve_model_and_tokenizer(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+    )
+
+
+def _reduce(token_scores: torch.Tensor, score_mode: str) -> float:
+    if score_mode == "first_token":
+        return float(token_scores[0].item())
+    if score_mode == "sum_logprob":
+        return float(token_scores.sum().item())
+    return float(token_scores.mean().item())
+
+
+_warned_lengths: set[int] = set()
+
+
+def _warn_if_too_long(length: int, tokenizer: Any) -> None:
+    limit = getattr(tokenizer, "model_max_length", None)
+    if limit is None or limit > 1_000_000 or length <= limit:
+        return
+    if limit not in _warned_lengths:
+        _warned_lengths.add(limit)
+        warnings.warn(
+            f"A prompt has {length} tokens but the tokenizer reports a maximum "
+            f"of {limit}. Lower max_passage_words so the slate fits.",
+            stacklevel=3,
+        )
+
+
+def _continuation_ids(
+    tokenizer: Any,
+    prompt: str,
+    prompt_ids: list[int],
+    answer: str,
+) -> tuple[int, list[int]]:
+    """Token ids of ``answer`` as they occur right after ``prompt``.
+
+    Returns (shared_prefix_length, full_ids). Tokenising prompt + answer
+    together keeps the answer tokens exactly as the model would see them;
+    the shared prefix is where the cached prompt can be reused.
+    """
+    full_ids = tokenizer(prompt + answer, add_special_tokens=True)["input_ids"]
+    full_ids = [int(value) for value in full_ids]
+
+    shared = 0
+    for a, b in zip(prompt_ids, full_ids):
+        if a != b:
+            break
+        shared += 1
+
+    if shared == len(full_ids):
+        raise ValueError(f"Candidate {answer!r} produced no tokens.")
+
+    return shared, full_ids
+
+
 @torch.inference_mode()
+def _score_causal(
+    prompt: str,
+    answers: Sequence[str],
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    score_mode: str,
+) -> list[float]:
+    prompt_ids = [
+        int(value)
+        for value in tokenizer(prompt, add_special_tokens=True)["input_ids"]
+    ]
+
+    if not prompt_ids:
+        start_token = tokenizer.bos_token_id
+        if start_token is None:
+            start_token = tokenizer.eos_token_id
+        if start_token is None:
+            raise ValueError("The model requires at least one prompt token.")
+        prompt_ids = [int(start_token)]
+        continuations = []
+        for answer in answers:
+            ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+            if not ids:
+                raise ValueError(f"Candidate {answer!r} produced no tokens.")
+            continuations.append((1, prompt_ids + [int(v) for v in ids]))
+    else:
+        continuations = [
+            _continuation_ids(tokenizer, prompt, prompt_ids, answer)
+            for answer in answers
+        ]
+
+    _warn_if_too_long(max(len(ids) for _, ids in continuations), tokenizer)
+
+    # Run the shared prefix once and reuse its key/value cache for the three
+    # candidates. The prefix must leave at least one token to predict from.
+    shared = min(length for length, _ in continuations)
+    shared = max(1, shared)
+
+    prefix = torch.tensor([continuations[0][1][:shared]], device=device)
+    prefix_output = model(
+        input_ids=prefix,
+        attention_mask=torch.ones_like(prefix),
+        use_cache=True,
+    )
+    last_log_probs = torch.log_softmax(prefix_output.logits[0, -1].float(), dim=-1)
+    cache = prefix_output.past_key_values
+
+    scores = []
+    for _, full_ids in continuations:
+        answer_ids = torch.tensor(full_ids[shared:], device=device)
+        token_scores = [last_log_probs[answer_ids[0]]]
+
+        if answer_ids.numel() > 1:
+            step_input = answer_ids[:-1].unsqueeze(0)
+            attention_mask = torch.ones(
+                (1, shared + step_input.shape[1]), dtype=torch.long, device=device
+            )
+            step_output = model(
+                input_ids=step_input,
+                attention_mask=attention_mask,
+                # Cache objects are updated in place, so each candidate needs
+                # its own copy of the prompt cache.
+                past_key_values=copy.deepcopy(cache),
+                use_cache=True,
+            )
+            step_log_probs = torch.log_softmax(step_output.logits[0].float(), dim=-1)
+            positions = torch.arange(step_input.shape[1], device=device)
+            token_scores.extend(step_log_probs[positions, answer_ids[1:]])
+
+        scores.append(_reduce(torch.stack(token_scores), score_mode))
+
+    return scores
+
+
+@torch.inference_mode()
+def _score_seq2seq(
+    prompt: str,
+    answers: Sequence[str],
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    score_mode: str,
+) -> list[float]:
+    encoded = tokenizer(prompt, add_special_tokens=True, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    _warn_if_too_long(int(input_ids.shape[1]), tokenizer)
+
+    # Encode the long prompt once; only the short decoder pass is repeated.
+    encoder_outputs = model.get_encoder()(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+
+    start_token = model.config.decoder_start_token_id
+    if start_token is None:
+        start_token = tokenizer.pad_token_id
+
+    scores = []
+    for answer in answers:
+        answer_ids = tokenizer(answer.strip(), add_special_tokens=False)["input_ids"]
+        if not answer_ids:
+            raise ValueError(f"Candidate {answer!r} produced no tokens.")
+        answer_ids = torch.tensor(answer_ids, device=device)
+
+        decoder_input_ids = torch.cat(
+            [torch.tensor([start_token], device=device), answer_ids[:-1]]
+        ).unsqueeze(0)
+
+        output = model(
+            encoder_outputs=encoder_outputs,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+        )
+        log_probs = torch.log_softmax(output.logits[0].float(), dim=-1)
+        positions = torch.arange(answer_ids.numel(), device=device)
+        scores.append(_reduce(log_probs[positions, answer_ids], score_mode))
+
+    return scores
+
+
+def score_candidates(
+    prompt: str,
+    candidates: Sequence[str],
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    score_mode: str = "mean_logprob",
+    answer_prefix: str = " ",
+) -> dict[str, float]:
+    """Score every candidate occupation as the answer to ``prompt``.
+
+    Candidates are occupation labels; they are scored in the form shown in
+    the prompt (underscores replaced by spaces).
+
+    ``mean_logprob`` is the default because occupation labels have different
+    numbers of tokens and several share a first token. CGLC must be trained
+    and tested with the same score mode.
+
+    Returns
+    -------
+    dict
+        {candidate label: score}, in the order given.
+    """
+    if score_mode not in VALID_SCORE_MODES:
+        raise ValueError(f"score_mode must be one of {sorted(VALID_SCORE_MODES)}")
+
+    answers = [answer_prefix + display_label(candidate) for candidate in candidates]
+
+    if is_encoder_decoder(model):
+        values = _score_seq2seq(prompt, answers, model, tokenizer, device, score_mode)
+    else:
+        values = _score_causal(prompt, answers, model, tokenizer, device, score_mode)
+
+    return {candidate: value for candidate, value in zip(candidates, values)}
+
+
 def score_candidate(
     prompt: str,
     candidate: str,
@@ -112,57 +366,16 @@ def score_candidate(
     score_mode: str = "mean_logprob",
     answer_prefix: str = " ",
 ) -> float:
-    """Score a complete candidate string with a causal language model.
-
-    ``mean_logprob`` is the default because occupation labels may contain
-    different numbers of tokens. CGLC must be trained and tested with the same
-    score mode.
-    """
-    valid_modes = {"first_token", "sum_logprob", "mean_logprob"}
-    if score_mode not in valid_modes:
-        raise ValueError(f"score_mode must be one of {sorted(valid_modes)}")
-
-    prompt_ids = tokenizer(
-        prompt,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )["input_ids"][0]
-
-    candidate_ids = tokenizer(
-        answer_prefix + candidate,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"][0]
-
-    if candidate_ids.numel() == 0:
-        raise ValueError(f"Candidate {candidate!r} produced no tokens.")
-
-    if prompt_ids.numel() == 0:
-        start_token = tokenizer.bos_token_id or tokenizer.eos_token_id
-        if start_token is None:
-            raise ValueError("The model requires at least one prompt token.")
-        prompt_ids = torch.tensor([start_token], dtype=torch.long)
-
-    input_ids = torch.cat([prompt_ids, candidate_ids]).unsqueeze(0).to(device)
-    attention_mask = torch.ones_like(input_ids)
-
-    output = model(input_ids=input_ids, attention_mask=attention_mask)
-    log_probabilities = torch.log_softmax(output.logits[0], dim=-1)
-
-    prompt_length = int(prompt_ids.numel())
-    token_positions = torch.arange(
-        prompt_length - 1,
-        prompt_length + int(candidate_ids.numel()) - 1,
+    """Score a single candidate string (see ``score_candidates``)."""
+    return score_candidates(
+        prompt=prompt,
+        candidates=[candidate],
+        model=model,
+        tokenizer=tokenizer,
         device=device,
-    )
-    candidate_ids = candidate_ids.to(device)
-    token_scores = log_probabilities[token_positions, candidate_ids]
-
-    if score_mode == "first_token":
-        return float(token_scores[0].item())
-    if score_mode == "sum_logprob":
-        return float(token_scores.sum().item())
-    return float(token_scores.mean().item())
+        score_mode=score_mode,
+        answer_prefix=answer_prefix,
+    )[candidate]
 
 
 def _load_calibrator(
@@ -216,7 +429,7 @@ def generate(
     prompt:
         Complete prompt returned by a method in prompt.py.
     model:
-        Hugging Face model name/path or an already-loaded causal LM.
+        Hugging Face model name/path or an already-loaded model.
     cglc:
         Loaded calibrator, path to cglc.json, or None for an uncalibrated run.
     signed_rsbe:
@@ -225,8 +438,8 @@ def generate(
     subject_group:
         Biography subject group, e.g. ``"Male"`` or ``"Female"``.
     candidates:
-        Optional explicit candidate list. If omitted, the three bullet-point
-        professions are extracted from the prompt.
+        Optional explicit candidate list (occupation labels). If omitted, the
+        three bullet-point professions are extracted from the prompt.
 
     Returns
     -------
@@ -238,6 +451,11 @@ def generate(
 
     if candidates is None:
         candidates = extract_candidates_from_prompt(prompt)
+        if calibrator is not None:
+            # The prompt shows "interior designer"; the calibrator knows the
+            # label "interior_designer".
+            by_display = {display_label(o): o for o in calibrator.occupations}
+            candidates = tuple(by_display.get(c, c) for c in candidates)
     else:
         candidates = tuple(str(value).strip() for value in candidates)
         if len(candidates) != 3 or len(set(candidates)) != 3:
@@ -251,17 +469,14 @@ def generate(
         trust_remote_code=trust_remote_code,
     )
 
-    raw_scores = {
-        candidate: score_candidate(
-            prompt=prompt,
-            candidate=candidate,
-            model=model,
-            tokenizer=tokenizer,
-            device=resolved_device,
-            score_mode=score_mode,
-        )
-        for candidate in candidates
-    }
+    raw_scores = score_candidates(
+        prompt=prompt,
+        candidates=candidates,
+        model=model,
+        tokenizer=tokenizer,
+        device=resolved_device,
+        score_mode=score_mode,
+    )
     base_prediction = max(raw_scores, key=raw_scores.get)
 
     if calibrator is None:
@@ -361,6 +576,17 @@ class FairRAGGenerator:
         )
         self.cglc = _load_calibrator(cglc)
         self.score_mode = score_mode
+
+    def score(self, prompt: str, candidates: Sequence[str]) -> dict[str, float]:
+        """Raw candidate scores for one prompt (no calibration)."""
+        return score_candidates(
+            prompt=prompt,
+            candidates=candidates,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            score_mode=self.score_mode,
+        )
 
     def generate(
         self,

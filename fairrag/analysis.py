@@ -24,7 +24,70 @@ def validate_columns(
             f"Available columns: "
             f"{dataframe.columns.tolist()}"
         )
+def compute_query_utility_metrics(slates):
+    """
+    Compute Hit@K, MRR@K and NDCG@K for each query.
+    """
 
+    rows = []
+
+    for bio_id, group in slates.groupby("bio_id"):
+
+        group = group.sort_values("rank")
+
+        relevance = (
+            group["relevant"]
+            .astype(int)
+            .tolist()
+        )
+
+        # Hit@K
+        hit = int(any(relevance))
+
+        # MRR
+        mrr = 0.0
+        for idx, rel in enumerate(relevance, start=1):
+            if rel:
+                mrr = 1.0 / idx
+                break
+
+        # DCG
+        dcg = sum(
+            rel / np.log2(rank + 1)
+            for rank, rel in enumerate(
+                relevance,
+                start=1,
+            )
+        )
+
+        # IDCG
+        ideal = sorted(
+            relevance,
+            reverse=True,
+        )
+
+        idcg = sum(
+            rel / np.log2(rank + 1)
+            for rank, rel in enumerate(
+                ideal,
+                start=1,
+            )
+        )
+
+        ndcg = (
+            dcg / idcg
+            if idcg > 0
+            else 0.0
+        )
+
+        rows.append({
+            "bio_id": bio_id,
+            "hit_at_k": hit,
+            "mrr_at_k": mrr,
+            "ndcg_at_k": ndcg,
+        })
+
+    return pd.DataFrame(rows)
 
 def extract_query_occupation(bio_ids):
     """
@@ -156,6 +219,17 @@ def analyse_retrieval_results(
     fgr_slates = pd.read_csv(
         fgr_slates_path
     )
+    vanilla_query_metrics = (
+    compute_query_utility_metrics(
+        vanilla_slates
+    )
+)
+
+    fgr_query_metrics = (
+    compute_query_utility_metrics(
+        fgr_slates
+    )
+)
 
     # ---------------------------------------------------------
     # Validate required columns
@@ -333,6 +407,53 @@ def analyse_retrieval_results(
             "_fgr",
         ),
         validate="one_to_one",)
+    fairness_per_query = (
+    fairness_per_query
+    .merge(
+        vanilla_query_metrics,
+        on="bio_id",
+        how="left",
+    )
+    .rename(
+        columns={
+            "hit_at_k": "hit_at_k_vanilla",
+            "mrr_at_k": "mrr_at_k_vanilla",
+            "ndcg_at_k": "ndcg_at_k_vanilla",
+        }
+    )
+)
+    fairness_per_query = (
+    fairness_per_query
+    .merge(
+        fgr_query_metrics,
+        on="bio_id",
+        how="left",
+    )
+    .rename(
+        columns={
+            "hit_at_k": "hit_at_k_fgr",
+            "mrr_at_k": "mrr_at_k_fgr",
+            "ndcg_at_k": "ndcg_at_k_fgr",
+        }
+    )
+)   
+    fairness_per_query["hit_change"] = (
+    fairness_per_query["hit_at_k_fgr"]
+    -
+    fairness_per_query["hit_at_k_vanilla"]
+)
+
+    fairness_per_query["mrr_change"] = (
+    fairness_per_query["mrr_at_k_fgr"]
+    -
+    fairness_per_query["mrr_at_k_vanilla"]
+)
+
+    fairness_per_query["ndcg_change"] = (
+    fairness_per_query["ndcg_at_k_fgr"]
+    -
+    fairness_per_query["ndcg_at_k_vanilla"]
+)
         # ---------------------------------------------------------
     # Calculate per-query fairness changes
     # ---------------------------------------------------------
@@ -1018,7 +1139,7 @@ def main():
     # ---------------------------------------------------------
     # Configure experiment file paths
     # ---------------------------------------------------------
-    results_dir = Path("datasets/10each")
+    results_dir = Path("results/retrieval/dense")
     output_dir = Path("results/analysis")
     print(results_dir)
     print(output_dir)
@@ -1030,22 +1151,22 @@ def main():
 
     vanilla_fairness_path = (
         results_dir
-        / "sparse_vanilla_fairness_per_query.csv"
+        / "dense_vanilla_fairness_per_query.csv"
     )
 
     fgr_fairness_path = (
         results_dir
-        / "sparse_fgr_fairness_per_query.csv"
+        / "dense_fgr_fairness_per_query.csv"
     )
 
     vanilla_slates_path = (
         results_dir
-        / "sparse_vanilla_slates.csv"
+        / "dense_vanilla_slates.csv"
     )
 
     fgr_slates_path = (
         results_dir
-        / "sparse_fgr_slates.csv"
+        / "dense_fgr_slates.csv"
     )
 
     # The labels must match the gender metadata stored

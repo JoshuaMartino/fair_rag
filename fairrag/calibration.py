@@ -26,6 +26,18 @@ Inference::
         candidate_mask=test_candidate_mask,
     )
 
+The objective is the paper's one-vs-rest task: every example belongs to a
+target occupation o (its test file) and counts as selected when the
+calibrated argmax over its three candidates is o. ``objective="rd"`` minimises
+the mean risk difference (Equation 11); ``objective="tpr_gap"`` minimises the
+mean TPR gap (equality of opportunity, Section 5.4) and needs ``labels``.
+
+Ablations (Table 5) are trained and applied with the same switches::
+
+    calibrator.fit(..., use_gate=False)          # "No eta"
+    calibrator.fit(..., use_delta_class=False)   # "No delta_o"
+    calibrator.fit(..., use_b_class=False)       # "No b_o"
+
 Notes
 -----
 The appendix describes six global scalars: delta, gamma, two group offsets,
@@ -58,6 +70,63 @@ class CGLCParameters:
     delta_class: dict[str, float] = field(default_factory=dict)
     b_class: dict[str, float] = field(default_factory=dict)
     max_shift: float = 1.0
+
+
+DEFAULT_OPTIONS = {
+    "use_gate": True,
+    "use_residual": True,
+    "use_delta_class": True,
+    "use_b_class": True,
+}
+
+VALID_OBJECTIVES = {"rd", "tpr_gap"}
+
+
+def one_vs_rest_selected(predictions: Any, example_targets: Any) -> np.ndarray:
+    """1 where the predicted occupation is the example's target occupation."""
+    predictions = np.asarray(predictions).astype(str)
+    example_targets = np.asarray(example_targets).astype(str)
+    return predictions == example_targets
+
+
+def one_vs_rest_gap(
+    selected: Any,
+    subject_groups: Any,
+    example_targets: Any,
+    groups: Sequence[str],
+    labels: Any | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Mean and per-occupation |selection-rate gap| between the two groups.
+
+    With ``labels`` omitted this is the risk difference RD(o) of Equation 11,
+    computed over all examples of occupation o's task. With ``labels`` given,
+    only positives (label 1) are used, which gives the TPR gap of Appendix C.4.
+    Occupations in which a group has no examples are left out of the mean.
+    """
+    selected = np.asarray(selected, dtype=bool)
+    subject_groups = np.asarray(subject_groups).astype(str)
+    example_targets = np.asarray(example_targets).astype(str)
+    group_a, group_b = [str(group) for group in groups]
+
+    keep = np.ones(len(selected), dtype=bool)
+    if labels is not None:
+        keep = np.asarray(labels).astype(int) == 1
+
+    per_class: dict[str, float] = {}
+    for occupation in dict.fromkeys(example_targets.tolist()):
+        rows = keep & (example_targets == occupation)
+        rows_a = rows & (subject_groups == group_a)
+        rows_b = rows & (subject_groups == group_b)
+        if not rows_a.any() or not rows_b.any():
+            continue
+        per_class[occupation] = abs(
+            float(selected[rows_a].mean()) - float(selected[rows_b].mean())
+        )
+
+    if not per_class:
+        raise ValueError("no occupation has examples from both protected groups")
+
+    return float(np.mean(list(per_class.values()))), per_class
 
 
 class ConfidenceGatedLogitCalibrator:
@@ -97,6 +166,12 @@ class ConfidenceGatedLogitCalibrator:
         self.rsbe_means: np.ndarray | None = None
         self.rsbe_stds: np.ndarray | None = None
         self.parameters = self._zero_parameters()
+
+        # Component switches and objective used at fit time. They are saved
+        # with the parameters and reused at inference (Appendix A.6, iv-v).
+        self.options = dict(DEFAULT_OPTIONS)
+        self.objective = "rd"
+        self.rd_mode = "one_vs_rest"
 
     def _zero_parameters(self, max_shift: float = 1.0) -> CGLCParameters:
         return CGLCParameters(
@@ -270,17 +345,29 @@ class ConfidenceGatedLogitCalibrator:
         subject_groups: Any,
         candidate_mask: Any | None = None,
         parameters: CGLCParameters | None = None,
-        use_gate: bool = True,
-        use_residual: bool = True,
-        use_delta_class: bool = True,
-        use_b_class: bool = True,
+        use_gate: bool | None = None,
+        use_residual: bool | None = None,
+        use_delta_class: bool | None = None,
+        use_b_class: bool | None = None,
     ) -> dict[str, np.ndarray]:
-        """Apply CGLC to raw pre-softmax candidate logits."""
+        """Apply CGLC to raw pre-softmax candidate logits.
+
+        The ``use_*`` switches default to the ones the calibrator was fitted
+        with.
+        """
         logits, signed_rsbe, subject_groups, candidate_mask = self._validate_inputs(
             logits, signed_rsbe, subject_groups, candidate_mask
         )
         if parameters is None:
             parameters = self.parameters
+        if use_gate is None:
+            use_gate = self.options["use_gate"]
+        if use_residual is None:
+            use_residual = self.options["use_residual"]
+        if use_delta_class is None:
+            use_delta_class = self.options["use_delta_class"]
+        if use_b_class is None:
+            use_b_class = self.options["use_b_class"]
 
         parameters = deepcopy(parameters)
         if not use_residual:
@@ -375,27 +462,54 @@ class ConfidenceGatedLogitCalibrator:
     def _objective(
         self,
         parameters: CGLCParameters,
-        logits: np.ndarray,
-        signed_rsbe: np.ndarray,
-        subject_groups: np.ndarray,
-        candidate_mask: np.ndarray,
+        data: Mapping[str, Any],
     ) -> float:
+        """Value to minimise for one candidate parameter set."""
         predictions = self.predict(
-            logits=logits,
-            signed_rsbe=signed_rsbe,
-            subject_groups=subject_groups,
-            candidate_mask=candidate_mask,
+            logits=data["logits"],
+            signed_rsbe=data["signed_rsbe"],
+            subject_groups=data["subject_groups"],
+            candidate_mask=data["candidate_mask"],
             parameters=parameters,
         )["predictions"]
-        value, _ = self.mean_risk_difference(predictions, subject_groups)
+
+        if self.objective == "rd" and self.rd_mode == "multiclass":
+            value, _ = self.mean_risk_difference(
+                predictions, data["subject_groups"]
+            )
+            return value
+
+        selected = one_vs_rest_selected(predictions, data["example_targets"])
+
+        accuracy_floor = data.get("accuracy_floor")
+        if accuracy_floor is not None:
+            accuracy = float(np.mean(selected == (data["labels"] == 1)))
+            if accuracy < accuracy_floor:
+                return float("inf")
+
+        value, _ = one_vs_rest_gap(
+            selected,
+            data["subject_groups"],
+            data["example_targets"],
+            self.groups,
+            labels=data["labels"] if self.objective == "tpr_gap" else None,
+        )
         return value
+
+    @staticmethod
+    def _subset(data: Mapping[str, Any], indices: np.ndarray) -> dict[str, Any]:
+        subset = dict(data)
+        for key in (
+            "logits", "signed_rsbe", "subject_groups", "candidate_mask",
+            "example_targets", "labels",
+        ):
+            if data.get(key) is not None:
+                subset[key] = data[key][indices]
+        return subset
 
     def _stage_a_random_search(
         self,
-        logits: np.ndarray,
-        signed_rsbe: np.ndarray,
-        subject_groups: np.ndarray,
-        candidate_mask: np.ndarray,
+        data: Mapping[str, Any],
         iterations: int,
         subset_fraction: float,
         max_shift: float,
@@ -407,17 +521,13 @@ class ConfidenceGatedLogitCalibrator:
         if not 0 < subset_fraction <= 1:
             raise ValueError("subset_fraction must be in (0, 1]")
 
-        subset_size = max(1, int(round(len(subject_groups) * subset_fraction)))
-        indices = self.rng.choice(len(subject_groups), subset_size, replace=False)
-        sub_logits = logits[indices]
-        sub_rsbe = signed_rsbe[indices]
-        sub_groups = subject_groups[indices]
-        sub_mask = candidate_mask[indices]
+        size = len(data["subject_groups"])
+        subset_size = max(1, int(round(size * subset_fraction)))
+        indices = self.rng.choice(size, subset_size, replace=False)
+        subset = self._subset(data, indices)
 
         best = self._zero_parameters(max_shift=max_shift)
-        best_objective = self._objective(
-            best, sub_logits, sub_rsbe, sub_groups, sub_mask
-        )
+        best_objective = self._objective(best, subset)
 
         for _ in range(iterations):
             candidate = self._zero_parameters(max_shift=max_shift)
@@ -434,9 +544,7 @@ class ConfidenceGatedLogitCalibrator:
                 for group in self.groups
             }
 
-            objective = self._objective(
-                candidate, sub_logits, sub_rsbe, sub_groups, sub_mask
-            )
+            objective = self._objective(candidate, subset)
             if objective < best_objective:
                 best, best_objective = candidate, objective
 
@@ -464,22 +572,20 @@ class ConfidenceGatedLogitCalibrator:
     def _stage_b_coordinate_descent(
         self,
         initial_parameters: CGLCParameters,
-        logits: np.ndarray,
-        signed_rsbe: np.ndarray,
-        subject_groups: np.ndarray,
-        candidate_mask: np.ndarray,
+        data: Mapping[str, Any],
         coordinate_offsets: Mapping[str, Sequence[float]],
         max_passes: int,
     ) -> tuple[CGLCParameters, float]:
         """Stage B: coordinate descent over the six global scalars."""
         best = deepcopy(initial_parameters)
-        best_objective = self._objective(
-            best, logits, signed_rsbe, subject_groups, candidate_mask
-        )
+        best_objective = self._objective(best, data)
 
-        coordinates = ["delta", "gamma"]
+        coordinates = ["delta"]
+        if self.options["use_gate"]:
+            coordinates.append("gamma")
         coordinates.extend(f"b_group::{group}" for group in self.groups)
-        coordinates.extend(["beta_positive", "beta_negative"])
+        if self.options["use_residual"]:
+            coordinates.extend(["beta_positive", "beta_negative"])
 
         for _ in range(max_passes):
             pass_improved = False
@@ -498,9 +604,7 @@ class ConfidenceGatedLogitCalibrator:
                     if name == "gamma":
                         value = max(0.0, value)
                     candidate = self._set_global(best, name, value)
-                    objective = self._objective(
-                        candidate, logits, signed_rsbe, subject_groups, candidate_mask
-                    )
+                    objective = self._objective(candidate, data)
                     if objective < coordinate_objective:
                         coordinate_best = candidate
                         coordinate_objective = objective
@@ -518,23 +622,24 @@ class ConfidenceGatedLogitCalibrator:
     def _stage_c_class_tuning(
         self,
         initial_parameters: CGLCParameters,
-        logits: np.ndarray,
-        signed_rsbe: np.ndarray,
-        subject_groups: np.ndarray,
-        candidate_mask: np.ndarray,
+        data: Mapping[str, Any],
         class_grid: Sequence[float],
         max_passes: int,
     ) -> tuple[CGLCParameters, float]:
         """Stage C: discrete tuning of delta_o and b_o for each class."""
         best = deepcopy(initial_parameters)
-        best_objective = self._objective(
-            best, logits, signed_rsbe, subject_groups, candidate_mask
-        )
+        best_objective = self._objective(best, data)
+
+        attributes = []
+        if self.options["use_delta_class"]:
+            attributes.append("delta_class")
+        if self.options["use_b_class"]:
+            attributes.append("b_class")
 
         for _ in range(max_passes):
             pass_improved = False
             for occupation in self.occupations:
-                for attribute in ("delta_class", "b_class"):
+                for attribute in attributes:
                     base = getattr(best, attribute).get(occupation, 0.0)
                     coordinate_best = best
                     coordinate_objective = best_objective
@@ -542,13 +647,7 @@ class ConfidenceGatedLogitCalibrator:
                     for offset in class_grid:
                         candidate = deepcopy(best)
                         getattr(candidate, attribute)[occupation] = base + float(offset)
-                        objective = self._objective(
-                            candidate,
-                            logits,
-                            signed_rsbe,
-                            subject_groups,
-                            candidate_mask,
-                        )
+                        objective = self._objective(candidate, data)
                         if objective < coordinate_objective:
                             coordinate_best = candidate
                             coordinate_objective = objective
@@ -570,6 +669,14 @@ class ConfidenceGatedLogitCalibrator:
         subject_groups: Any,
         target_occupations: Any,
         candidate_mask: Any | None = None,
+        labels: Any | None = None,
+        objective: str = "rd",
+        rd_mode: str = "one_vs_rest",
+        use_gate: bool = True,
+        use_residual: bool = True,
+        use_delta_class: bool = True,
+        use_b_class: bool = True,
+        max_accuracy_drop: float | None = None,
         stage_a_iterations: int = 500,
         stage_a_subset_fraction: float = 0.4,
         stage_b_passes: int = 5,
@@ -579,15 +686,83 @@ class ConfidenceGatedLogitCalibrator:
         coordinate_offsets: Mapping[str, Sequence[float]] | None = None,
         class_grid: Sequence[float] | None = None,
     ) -> dict[str, Any]:
-        """Fit CGLC with random search, coordinate descent, and class tuning."""
+        """Fit CGLC with random search, coordinate descent, and class tuning.
+
+        target_occupations
+            The target occupation o of each example's one-vs-rest task (the
+            ``target`` column). Used for the per-class RSBE statistics and
+            for the objective.
+        labels
+            1 where the biography's true occupation is the target, else 0.
+            Required for ``objective="tpr_gap"`` and ``max_accuracy_drop``.
+        objective
+            "rd" (demographic parity, Equation 11) or "tpr_gap" (equality of
+            opportunity, Section 5.4).
+        rd_mode
+            "one_vs_rest" (default, the paper's task) or "multiclass" (the
+            earlier behaviour: selection-rate gap of each occupation over all
+            examples).
+        use_gate, use_residual, use_delta_class, use_b_class
+            Component switches for the ablations of Table 5. A switched-off
+            component is neither searched nor applied.
+        max_accuracy_drop
+            Optional guard that is not in the paper: reject parameter sets
+            whose one-vs-rest accuracy falls more than this far below the
+            uncalibrated accuracy. Equation 11 alone can be lowered by simply
+            never selecting the target.
+        """
         logits, signed_rsbe, subject_groups, candidate_mask = self._validate_inputs(
             logits, signed_rsbe, subject_groups, candidate_mask
         )
         target_occupations = np.asarray(target_occupations).astype(str)
         if len(target_occupations) != len(subject_groups):
             raise ValueError("target_occupations must match the number of examples")
+        if objective not in VALID_OBJECTIVES:
+            raise ValueError(f"objective must be one of {sorted(VALID_OBJECTIVES)}")
+        if rd_mode not in {"one_vs_rest", "multiclass"}:
+            raise ValueError("rd_mode must be 'one_vs_rest' or 'multiclass'")
+        if labels is not None:
+            labels = np.asarray(labels).astype(int)
+            if len(labels) != len(subject_groups):
+                raise ValueError("labels must match the number of examples")
+        if labels is None and (objective == "tpr_gap" or max_accuracy_drop is not None):
+            raise ValueError("labels are required for this objective or guard")
+
+        self.options = {
+            "use_gate": bool(use_gate),
+            "use_residual": bool(use_residual),
+            "use_delta_class": bool(use_delta_class),
+            "use_b_class": bool(use_b_class),
+        }
+        self.objective = objective
+        self.rd_mode = rd_mode
 
         self.fit_rsbe_statistics(signed_rsbe, target_occupations)
+
+        data: dict[str, Any] = {
+            "logits": logits,
+            "signed_rsbe": signed_rsbe,
+            "subject_groups": subject_groups,
+            "candidate_mask": candidate_mask,
+            "example_targets": target_occupations,
+            "labels": labels,
+            "accuracy_floor": None,
+        }
+
+        zero = self._zero_parameters(max_shift=max_shift)
+        initial_objective = self._objective(zero, data)
+
+        if max_accuracy_drop is not None:
+            base_predictions = self.predict(
+                logits=logits,
+                signed_rsbe=signed_rsbe,
+                subject_groups=subject_groups,
+                candidate_mask=candidate_mask,
+                parameters=zero,
+            )["predictions"]
+            base_selected = one_vs_rest_selected(base_predictions, target_occupations)
+            base_accuracy = float(np.mean(base_selected == (labels == 1)))
+            data["accuracy_floor"] = base_accuracy - float(max_accuracy_drop)
 
         if search_ranges is None:
             search_ranges = {
@@ -606,31 +781,26 @@ class ConfidenceGatedLogitCalibrator:
         if class_grid is None:
             class_grid = (-0.30, -0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20, 0.30)
 
-        stage_a_parameters, stage_a_rd = self._stage_a_random_search(
-            logits,
-            signed_rsbe,
-            subject_groups,
-            candidate_mask,
+        stage_a_parameters, stage_a_value = self._stage_a_random_search(
+            data,
             stage_a_iterations,
             stage_a_subset_fraction,
             max_shift,
             search_ranges,
         )
-        stage_b_parameters, stage_b_rd = self._stage_b_coordinate_descent(
+        # Stage A is scored on a subset. Only keep its result as the warm
+        # start if it is no worse than doing nothing on the full set.
+        if self._objective(stage_a_parameters, data) > initial_objective:
+            stage_a_parameters = zero
+        stage_b_parameters, stage_b_value = self._stage_b_coordinate_descent(
             stage_a_parameters,
-            logits,
-            signed_rsbe,
-            subject_groups,
-            candidate_mask,
+            data,
             coordinate_offsets,
             stage_b_passes,
         )
-        stage_c_parameters, stage_c_rd = self._stage_c_class_tuning(
+        stage_c_parameters, stage_c_value = self._stage_c_class_tuning(
             stage_b_parameters,
-            logits,
-            signed_rsbe,
-            subject_groups,
-            candidate_mask,
+            data,
             class_grid,
             stage_c_passes,
         )
@@ -638,9 +808,15 @@ class ConfidenceGatedLogitCalibrator:
 
         return {
             "parameters": deepcopy(self.parameters),
-            "stage_a_rd": float(stage_a_rd),
-            "stage_b_rd": float(stage_b_rd),
-            "stage_c_rd": float(stage_c_rd),
+            "objective": objective,
+            "initial_value": float(initial_objective),
+            "stage_a_value": float(stage_a_value),
+            "stage_b_value": float(stage_b_value),
+            "stage_c_value": float(stage_c_value),
+            # Earlier key names, kept for existing code.
+            "stage_a_rd": float(stage_a_value),
+            "stage_b_rd": float(stage_b_value),
+            "stage_c_rd": float(stage_c_value),
         }
 
     def save(self, file_path: str | Path) -> None:
@@ -656,6 +832,9 @@ class ConfidenceGatedLogitCalibrator:
             "epsilon": self.epsilon,
             "random_state": self.random_state,
             "parameters": asdict(self.parameters),
+            "options": dict(self.options),
+            "objective": self.objective,
+            "rd_mode": self.rd_mode,
             "rsbe_means": self.rsbe_means.tolist(),
             "rsbe_stds": self.rsbe_stds.tolist(),
         }
@@ -672,6 +851,9 @@ class ConfidenceGatedLogitCalibrator:
             random_state=payload.get("random_state", 42),
         )
         calibrator.parameters = CGLCParameters(**payload["parameters"])
+        calibrator.options = {**DEFAULT_OPTIONS, **payload.get("options", {})}
+        calibrator.objective = payload.get("objective", "rd")
+        calibrator.rd_mode = payload.get("rd_mode", "one_vs_rest")
         calibrator.rsbe_means = np.asarray(payload["rsbe_means"], dtype=np.float64)
         calibrator.rsbe_stds = np.asarray(payload["rsbe_stds"], dtype=np.float64)
         return calibrator

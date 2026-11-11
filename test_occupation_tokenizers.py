@@ -175,7 +175,54 @@ def find_column(fieldnames, candidates):
         if candidate.lower() in lookup:
             return lookup[candidate.lower()]
     return None
+def get_tokens():
+    import csv
+    from transformers import AutoTokenizer, AutoProcessor
 
+    model_name = "google/gemma-4-31B-it"
+
+    tokenizer = AutoProcessor.from_pretrained(
+    model_name,
+    use_fast=True,
+    )
+    tokenizer = tokenizer.tokenizer
+
+    output_file = "llama_tokens2.csv"
+   # embedding_matrix = tokenizer.get_input_embeddings().weight
+
+    with open(output_file, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+
+        writer.writerow([
+        "token_id",
+        "raw_token",
+        "decoded_token",
+        "is_special",
+      #  "embedding_vector",
+        ])
+
+        special_ids = set(tokenizer.all_special_ids)
+
+        for token_id in range(len(tokenizer)):
+            raw_token = tokenizer.convert_ids_to_tokens(token_id)
+
+            decoded_token = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+            )
+            #embedding_vector = (embedding_matrix[token_id].detach().float().cpu().tolist())
+            #embedding_json = json.dumps(embedding_vector)
+
+            writer.writerow([
+            token_id,
+            raw_token,
+            decoded_token,
+            token_id in special_ids,
+        #    embedding_json
+            ])
+
+    print(f"Saved {len(tokenizer)} tokens to {output_file}")
 
 def check_option_rows(path, tokenizer, is_encoder_decoder, prompt, separator):
     collisions = []
@@ -289,8 +336,10 @@ def parse_args():
     parser.add_argument("--fail-on-collision", action="store_true")
     return parser.parse_args()
 
-
 def main():
+    get_tokens()
+    return 0
+def main1():
     args = parse_args()
     print(args)
     prompt = (
@@ -353,4 +402,21 @@ def main():
 
 
 if __name__ == "__main__":
+    from huggingface_hub import hf_hub_download
+    import json
+
+    path = hf_hub_download(
+    "google/gemma-4-31B-it",
+    "tokenizer_config.json"
+    )
+
+    print(path)
+
+    with open(path) as f:
+        config = json.load(f)
+
+    print(config.keys())
+
+    print(config.get("extra_special_tokens"))
+    print(config["tokenizer_class"])
     raise SystemExit(main())

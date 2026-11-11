@@ -449,12 +449,9 @@ def test_create_sparse_index_writes_same_docs_and_returns_store(tmp_path):
         "occupation": "rapper",
     }
 
-    # Verify persistence was requested
-    pickle_dump.assert_called_once()
-
-    dumped_store = pickle_dump.call_args.args[0]
-
-    assert dumped_store is store
+    # Verify persistence was requested (Appendix A.4: save_to_disk)
+    store.save_to_disk.assert_called_once_with(str(save_path))
+    pickle_dump.assert_not_called()
 
     # Verify function return
     assert result is store

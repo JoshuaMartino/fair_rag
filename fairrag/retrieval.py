@@ -27,12 +27,13 @@ def sparse_retrieve(document_store, bios_df, top_k=100):
         for doc in result["documents"]:
             if doc.meta['gender'] == 'Male':
                 male_count+=1
-            else: female_count+=1
+            elif doc.meta['gender'] == 'Female':
+                female_count+=1
     print("Male docs in pool:", str(male_count))
     print("female docs in pool:", str(female_count))
     return pool
-def dense_retrieve(document_store, bios_df, top_k=100):
-    embedder = SentenceTransformer("BAAI/bge-large-en")
+def dense_retrieve(document_store, bios_df, top_k=100, model_name="BAAI/bge-large-en"):
+    embedder = SentenceTransformer(model_name)
     retriever = FAISSEmbeddingRetriever(document_store = document_store, top_k=top_k)
     pool = {}
     for _, row in bios_df.iterrows():

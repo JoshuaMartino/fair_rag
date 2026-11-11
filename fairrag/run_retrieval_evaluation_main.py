@@ -1,14 +1,20 @@
-"""Evaluate Vanilla retrieval and FGR using the project's implemented methods.
+"""Retrieval stage: Vanilla, DetConstSort and FGR (Table 1 of the paper).
 
-Example:
-    python run_retrieval_evaluation.py \
-        --test-folder datasets/test \
-        --dense-index wiki_people \
-        --sparse-index bm25_store.pkl \
-        --retriever both \
-        --pool-k 100 \
-        --final-k 10 \
-        --output-dir results/retrieval
+Run from inside ``fairrag/`` (edit the configuration block in ``main`` first):
+
+    python run_retrieval_evaluation_main.py
+
+For every query set (test and, if present, the CGLC training set) and every
+retriever this writes, under ``results/retrieval/<split>/``:
+
+    <retriever>_<reranker>_slates.csv              one row per ranked document
+    <retriever>_<reranker>_fairness_per_query.csv  NDKL, signed NDKL, skew
+    retrieval_summary.csv                          Table 1 rows
+    skew_sweep.csv                                 skew definition x epsilon
+    evaluation_config.json
+
+The slates files are the input of the generation stage
+(``run_generation_main.py``), so the LLMs never need the indexes.
 """
 
 from __future__ import annotations
@@ -18,13 +24,40 @@ from pathlib import Path
 
 import pandas as pd
 
-from index import load_dense_index, load_sparse_index
-from metrics import group_exposure, hit_at_k, mean_ndkl, mrr, ndcg_at_k, prefix_skew
-from rerankers import fgr, rsbe
-from retrieval import dense_retrieve, sparse_retrieve
+from metrics import (
+    group_exposure,
+    hit_at_k,
+    mean_ndkl,
+    mrr,
+    ndcg_at_k,
+    prefix_skew,
+    skew_at_k,
+)
+from rerankers import det_const_sort, fgr, rsbe
+from slates import save_slates
 
 
-def load_test_collections(test_folder=None, test_file=None):
+# Table 1 of the paper, for a side-by-side print at the end of a run.
+PAPER_TABLE_1 = {
+    ("dense", "vanilla"): (0.438, 0.281, 0.310, -3.441, 0.525, 0.488),
+    ("dense", "det_const_sort"): (0.461, 0.263, 0.301, -0.375, 0.156, 0.147),
+    ("dense", "fgr"): (0.462, 0.263, 0.301, -0.381, 0.161, 0.146),
+    ("sparse", "vanilla"): (0.474, 0.284, 0.318, -3.781, 0.515, 0.488),
+    ("sparse", "det_const_sort"): (0.480, 0.241, 0.289, -1.515, 0.263, 0.227),
+    ("sparse", "fgr"): (0.479, 0.238, 0.288, -1.510, 0.268, 0.227),
+}
+
+SKEW_SWEEP_EPSILONS = (1e-12, 1e-9, 1e-6, 1e-4, 1e-3, 1e-2, 1e-1)
+
+
+def load_test_collections(test_folder=None, test_file=None, max_rows_per_file=None):
+    """Load the per-occupation query files.
+
+    max_rows_per_file : int, optional
+        Debugging aid. Leave as None for a real run: the files are written
+        male-positive rows first, so ``head(10)`` keeps only male, y=1
+        biographies and the result is not comparable with the paper.
+    """
     if test_file:
         paths = [Path(test_file)]
     else:
@@ -36,7 +69,11 @@ def load_test_collections(test_folder=None, test_file=None):
     collections = []
     for path in paths:
         frame = pd.read_csv(path)
-        frame = frame.head(10)
+        if max_rows_per_file is not None:
+            # Sample across the whole file so every gender/label cell is kept.
+            frame = frame.sample(
+                n=min(max_rows_per_file, len(frame)), random_state=42
+            )
         if "target" not in frame.columns:
             frame["target"] = path.stem
         collections.append(frame)
@@ -75,8 +112,9 @@ def prepare_queries(test_collections, positive_only=False):
                 raise KeyError("--positive-only requires a 'y' column.")
             frame = frame[frame["y"] == 1].copy()
 
-        # The same biography may occur in multiple occupation files. The retrievers
-        # return a dict keyed by bio_id, so make each query key experiment-specific.
+        # The same biography may occur in multiple occupation files (and, in
+        # train.csv, under several targets). The retrievers return a dict
+        # keyed by bio_id, so make each query key experiment-specific.
         frame["original_bio_id"] = frame["bio_id"]
         frame["bio_id"] = (
             frame["target"].astype(str)
@@ -114,13 +152,47 @@ def average_prefix_skew(skew_results, key):
     return sum(result[key] for result in skew_results.values()) / len(skew_results)
 
 
-def evaluate_slate(name, retriever_name, pool, query_occupations, final_k, q):
-    rsbe_results = rsbe(pool, q=q, group_field="gender")
-    skew_results = prefix_skew(
+def utility_metrics(pool, relevance, final_k, suffix):
+    return {
+        f"hit_at_k{suffix}": hit_at_k(pool, relevance, final_k),
+        # mrr() has no K parameter, but pool is already truncated to final_k.
+        f"mrr_at_k{suffix}": mrr(pool, relevance),
+        f"ndcg_at_k{suffix}": ndcg_at_k(pool, relevance, final_k),
+    }
+
+
+def evaluate_slate(
+    name,
+    retriever_name,
+    pool,
+    query_targets,
+    query_sources,
+    final_k,
+    q,
+    skew_epsilon=1e-12,
+    ndkl_epsilon=1e-12,
+):
+    """Utility and fairness metrics for one (retriever, reranker) slate set.
+
+    Utility is reported under both relevance definitions:
+
+    *_target : a passage is relevant when its occupation equals the occupation
+               of the test file the biography sits in (the task label o). All
+               400 rows of a file are scored, including the 200 negatives.
+    *_source : a passage is relevant when its occupation equals the
+               biography's own occupation.
+    """
+    groups = list(q)
+    rsbe_results = rsbe(pool, q=q, group_field="gender", epsilon=ndkl_epsilon)
+    skew_results = skew_at_k(
+        pool, q=q, K=final_k, group_field="gender", epsilon=skew_epsilon
+    )
+    prefix_results = prefix_skew(
         pool,
-        group_a0=list(q)[0],
-        group_a1=list(q)[1],
+        group_a0=groups[0],
+        group_a1=groups[1],
         group_field="gender",
+        epsilon=skew_epsilon,
     )
     exposure = group_exposure(pool, K=final_k, group_field="gender")
 
@@ -129,14 +201,20 @@ def evaluate_slate(name, retriever_name, pool, query_occupations, final_k, q):
         "reranker": name,
         "queries": len(pool),
         "k": final_k,
-        "hit_at_k": hit_at_k(pool, query_occupations, final_k),
-        # mrr() has no K parameter, but pool is already truncated to final_k.
-        "mrr_at_k": mrr(pool, query_occupations),
-        "ndcg_at_k": ndcg_at_k(pool, query_occupations, final_k),
-        "mean_ndkl": mean_ndkl(rsbe_results),
-        "mean_min_skew": average_prefix_skew(skew_results, "min_skew"),
-        "mean_max_skew": average_prefix_skew(skew_results, "max_skew"),
     }
+    result.update(utility_metrics(pool, query_targets, final_k, "_target"))
+    result.update(utility_metrics(pool, query_sources, final_k, "_source"))
+    result.update(
+        {
+            "mean_ndkl": mean_ndkl(rsbe_results),
+            # Skew@K of Geyik et al.: comparable with Table 1.
+            "mean_min_skew": average_prefix_skew(skew_results, "min_skew"),
+            "mean_max_skew": average_prefix_skew(skew_results, "max_skew"),
+            # Appendix C.2 read literally (log-odds over every prefix).
+            "mean_prefix_min_skew": average_prefix_skew(prefix_results, "min_skew"),
+            "mean_prefix_max_skew": average_prefix_skew(prefix_results, "max_skew"),
+        }
+    )
 
     for group in q:
         result[f"mean_signed_ndkl_group_{group}"] = average_signed_ndkl(
@@ -144,79 +222,90 @@ def evaluate_slate(name, retriever_name, pool, query_occupations, final_k, q):
         )
         result[f"exposure_group_{group}"] = exposure.get(group, 0.0)
 
-    return result, rsbe_results, skew_results
+    return result, rsbe_results, skew_results, prefix_results
 
 
-def documents_to_rows(pool, retriever_name, reranker_name):
+def skew_definition_sweep(pool, retriever_name, reranker_name, final_k, q):
+    """Mean Min/Max skew under both definitions for a range of epsilons.
+
+    The paper reports neither the epsilon nor (unambiguously) the definition,
+    so this table is what to compare against the Min/Max Skew columns of
+    Table 1.
+    """
+    groups = list(q)
     rows = []
-    for bio_id, docs in pool.items():
-        for rank, doc in enumerate(docs, start=1):
-            rows.append(
-                {
-                    "bio_id": bio_id,
-                    "retriever": retriever_name,
-                    "reranker": reranker_name,
-                    "rank": rank,
-                    "score": doc.score,
-                    "content": doc.content,
-                    "gender": doc.meta.get("gender"),
-                    "occupation": doc.meta.get("occupation"),
-                    "title": doc.meta.get("title", doc.meta.get("name")),
-                }
-            )
-    return pd.DataFrame(rows)
+    for epsilon in SKEW_SWEEP_EPSILONS:
+        at_k = skew_at_k(pool, q=q, K=final_k, group_field="gender", epsilon=epsilon)
+        prefix = prefix_skew(
+            pool,
+            group_a0=groups[0],
+            group_a1=groups[1],
+            group_field="gender",
+            epsilon=epsilon,
+        )
+        rows.append(
+            {
+                "retriever": retriever_name,
+                "reranker": reranker_name,
+                "epsilon": epsilon,
+                "skew_at_k_min": average_prefix_skew(at_k, "min_skew"),
+                "skew_at_k_max": average_prefix_skew(at_k, "max_skew"),
+                "prefix_log_odds_min": average_prefix_skew(prefix, "min_skew"),
+                "prefix_log_odds_max": average_prefix_skew(prefix, "max_skew"),
+            }
+        )
+    return rows
 
 
-def run_retriever(
+def rerank_all(retrieved_pool, final_k, q):
+    """All retriever-side systems of Table 1 that need no LLM."""
+    return {
+        "vanilla": vanilla_pool(retrieved_pool, final_k),
+        "det_const_sort": det_const_sort(
+            retrieved_pool, q=q, K=final_k, group_field="gender"
+        ),
+        "fgr": fgr(retrieved_pool, q=q, K=final_k, group_field="gender"),
+    }
+
+
+def evaluate_and_save(
+    slates_by_reranker,
     retriever_name,
-    document_store,
-    queries,
-    query_occupations,
-    pool_k,
+    query_targets,
+    query_sources,
     final_k,
     q,
     output_dir,
+    skew_epsilon=1e-12,
 ):
-    query_frame = queries[["bio_id", "bio"]]
-    print("here")
-
-    if retriever_name == "dense":
-        retrieved_pool = dense_retrieve(document_store, query_frame, top_k=pool_k)
-    else:
-        retrieved_pool = sparse_retrieve(document_store, query_frame, top_k=pool_k)
-
-    missing = set(query_frame["bio_id"]) - set(retrieved_pool)
-    if missing:
-        raise ValueError(f"{retriever_name} retrieval omitted {len(missing)} queries.")
-    print("target distrabution:", q)
-    observed_groups = {doc.meta.get("gender") for docs in retrieved_pool.values() for doc in docs}
-    expected_groups = set(q)
-    print("obsereved documents groups:", observed_groups)
-    print("expected document groups:", expected_groups)
-    
-    print({
-    repr(doc.meta.get("gender"))
-    for docs in retrieved_pool.values()
-    for doc in docs
-})
-    vanilla = vanilla_pool(retrieved_pool, final_k)
-    fair = fgr(retrieved_pool, q=q, K=final_k, group_field="gender")
+    """Evaluate each slate set, write its CSVs, and return summary rows."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     summaries = []
-    for reranker_name, slate in [("vanilla", vanilla), ("fgr", fair)]:
-        summary, rsbe_results, skew_results = evaluate_slate(
+    sweep_rows = []
+
+    for reranker_name, slate in slates_by_reranker.items():
+        summary, rsbe_results, skew_results, prefix_results = evaluate_slate(
             reranker_name,
             retriever_name,
             slate,
-            query_occupations,
+            query_targets,
+            query_sources,
             final_k,
             q,
+            skew_epsilon=skew_epsilon,
         )
         summaries.append(summary)
+        sweep_rows.extend(
+            skew_definition_sweep(slate, retriever_name, reranker_name, final_k, q)
+        )
 
-        documents_to_rows(slate, retriever_name, reranker_name).to_csv(
+        save_slates(
+            slate,
+            retriever_name,
+            reranker_name,
             output_dir / f"{retriever_name}_{reranker_name}_slates.csv",
-            index=False,
         )
 
         fairness_rows = []
@@ -233,6 +322,8 @@ def run_retriever(
                     },
                     "min_skew": skew_results[bio_id]["min_skew"],
                     "max_skew": skew_results[bio_id]["max_skew"],
+                    "prefix_min_skew": prefix_results[bio_id]["min_skew"],
+                    "prefix_max_skew": prefix_results[bio_id]["max_skew"],
                 }
             )
         pd.DataFrame(fairness_rows).to_csv(
@@ -240,35 +331,147 @@ def run_retriever(
             index=False,
         )
 
-    return summaries
+    return summaries, sweep_rows
+
+
+def run_retriever(
+    retriever_name,
+    document_store,
+    queries,
+    query_targets,
+    query_sources,
+    pool_k,
+    final_k,
+    q,
+    output_dir,
+    skew_epsilon=1e-12,
+    dense_model_name="BAAI/bge-large-en",
+):
+    # Imported here so the metric code can be used without Haystack installed.
+    from retrieval import dense_retrieve, sparse_retrieve
+
+    query_frame = queries[["bio_id", "bio"]]
+
+    if retriever_name == "dense":
+        retrieved_pool = dense_retrieve(
+            document_store, query_frame, top_k=pool_k, model_name=dense_model_name
+        )
+    else:
+        retrieved_pool = sparse_retrieve(document_store, query_frame, top_k=pool_k)
+
+    missing = set(query_frame["bio_id"]) - set(retrieved_pool)
+    if missing:
+        raise ValueError(f"{retriever_name} retrieval omitted {len(missing)} queries.")
+
+    observed_groups = {
+        doc.meta.get("gender") for docs in retrieved_pool.values() for doc in docs
+    }
+    unexpected = observed_groups - set(q)
+    print("Target distribution:", q)
+    print("Document groups in the retrieved pools:", sorted(map(repr, observed_groups)))
+    if unexpected:
+        print(
+            "Note: documents with groups outside q "
+            f"({sorted(map(repr, unexpected))}) count towards slate length "
+            "but towards no group's share."
+        )
+    if not observed_groups & set(q):
+        raise ValueError(
+            "No retrieved document has a gender label that appears in q. "
+            "Check that the keys of q match the index metadata exactly."
+        )
+
+    slates_by_reranker = rerank_all(retrieved_pool, final_k, q)
+
+    return evaluate_and_save(
+        slates_by_reranker,
+        retriever_name,
+        query_targets,
+        query_sources,
+        final_k,
+        q,
+        output_dir,
+        skew_epsilon=skew_epsilon,
+    )
+
+
+def print_summary(summary, relevance_suffix):
+    display_columns = [
+        "retriever",
+        "reranker",
+        f"hit_at_k{relevance_suffix}",
+        f"mrr_at_k{relevance_suffix}",
+        f"ndcg_at_k{relevance_suffix}",
+        "mean_min_skew",
+        "mean_max_skew",
+        "mean_ndkl",
+    ]
+    display_columns = [c for c in display_columns if c in summary.columns]
+    print(summary[display_columns].round(3).to_string(index=False))
+
+
+def print_paper_table(summary):
+    rows = []
+    for row in summary.itertuples(index=False):
+        reference = PAPER_TABLE_1.get((row.retriever, row.reranker))
+        if reference is None:
+            continue
+        rows.append(
+            dict(
+                zip(
+                    ["retriever", "reranker", "hit", "mrr", "ndcg",
+                     "min_skew", "max_skew", "ndkl"],
+                    (row.retriever, row.reranker) + reference,
+                )
+            )
+        )
+    if rows:
+        print(pd.DataFrame(rows).to_string(index=False))
 
 
 def main():
     # ------------------------------------------------------------------
     # Experiment configuration: edit these values before running.
     # ------------------------------------------------------------------
-    test_folder = Path("datasets/occupations/")
-    test_file = None  # e.g. Path("datasets/test/rapper.csv"); overrides folder
+    # Query sets. "test" is the 22 x 400 inference set; "train" is the CGLC
+    # optimisation set (only needed for the generation stage). A value can be
+    # a folder of per-occupation CSVs or a single CSV. Missing paths are
+    # skipped.
+    query_sets = {
+        "test": Path("datasets/occupations/"),
+        "train": Path("datasets/train/train.csv"),
+    }
 
     retriever_to_run = "sparse"  # "dense", "sparse", or "both"
     dense_index_path = "wiki_people"
     sparse_index_path = "datasets/wiki_name_sparse.json"
+    dense_model_name = "BAAI/bge-large-en"
 
-    pool_k = 100
-    final_k = 15
+    pool_k = 100   # T, Appendix A.5 (TOP_K=100)
+    final_k = 15   # K, Appendix A.5 (DISPLAY_K=15)
 
-    # Use "source_profession" for the biography's true occupation.
-    # Use "target" for the occupation associated with the test collection.
-    relevance_column = "source_profession"
+    # Which relevance definition the printed table uses. Both are always
+    # computed and saved (columns *_target and *_source).
+    #   "target"            passage occupation == occupation of the test file
+    #   "source_profession" passage occupation == the biography's occupation
+    relevance_column = "target"
 
     # Set True to evaluate only y=1 biographies.
     positive_only = False
 
-    # gender metadata: 0=male, 1=female
+    # Debugging only: number of rows sampled from each query file.
+    max_rows_per_file = None
+
+    # Keys must match the gender metadata stored in the indexes.
     q = {'Male': 0.5, 'Female': 0.5}
 
-    output_dir = Path("results/retrieval")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Smoothing for the skew columns of the summary. Not reported in the
+    # paper. 1e-4 is the value at which the dense slates of this reproduction
+    # give Table 1's Min/Max Skew for both Vanilla and FGR (within 0.05);
+    # skew_sweep.csv shows the columns for a range of values.
+    skew_epsilon = 1e-4
+
+    output_root = Path("results/retrieval")
 
     if pool_k < final_k:
         raise ValueError("pool_k must be greater than or equal to final_k.")
@@ -279,90 +482,106 @@ def main():
     if relevance_column not in {"source_profession", "target"}:
         raise ValueError("relevance_column must be 'source_profession' or 'target'.")
 
-    test_collections = load_test_collections(
-        test_folder=None if test_file is not None else test_folder,
-        test_file=test_file,
-    )
-    queries = prepare_queries(test_collections, positive_only=positive_only)
-    query_occupations = dict(zip(queries["bio_id"], queries[relevance_column]))
+    from index import load_dense_index, load_sparse_index
 
-    summaries = []
-
+    stores = {}
     if retriever_to_run in {"dense", "both"}:
         print("Loading dense index...")
-        dense_store = load_dense_index(dense_index_path)
-        print(f"Running dense retrieval for {len(queries)} queries...")
-        summaries.extend(
-            run_retriever(
-                "dense",
-                dense_store,
-                queries,
-                query_occupations,
-                pool_k,
-                final_k,
-                q,
-                output_dir,
-            )
-        )
-
+        stores["dense"] = load_dense_index(dense_index_path)
     if retriever_to_run in {"sparse", "both"}:
         print("Loading sparse index...")
-        sparse_store = load_sparse_index(sparse_index_path)
-        print(f"Running sparse retrieval for {len(queries)} queries...")
-        summaries.extend(
-            run_retriever(
-                "sparse",
-                sparse_store,
+        stores["sparse"] = load_sparse_index(sparse_index_path)
+
+    summaries_by_split = {}
+
+    for split, query_path in query_sets.items():
+        query_path = Path(query_path)
+        if not query_path.exists():
+            print(f"Skipping '{split}': {query_path} does not exist.")
+            continue
+
+        output_dir = output_root / split
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if query_path.is_dir():
+            collections = load_test_collections(
+                test_folder=query_path, max_rows_per_file=max_rows_per_file
+            )
+        else:
+            collections = load_test_collections(
+                test_file=query_path, max_rows_per_file=max_rows_per_file
+            )
+        queries = prepare_queries(collections, positive_only=positive_only)
+        query_targets = dict(zip(queries["bio_id"], queries["target"]))
+        query_sources = dict(zip(queries["bio_id"], queries["source_profession"]))
+
+        summaries = []
+        sweep_rows = []
+
+        for retriever_name, store in stores.items():
+            print(f"[{split}] Running {retriever_name} retrieval for {len(queries)} queries...")
+            retriever_summaries, retriever_sweep = run_retriever(
+                retriever_name,
+                store,
                 queries,
-                query_occupations,
+                query_targets,
+                query_sources,
                 pool_k,
                 final_k,
                 q,
                 output_dir,
+                skew_epsilon=skew_epsilon,
+                dense_model_name=dense_model_name,
             )
-        )
+            summaries.extend(retriever_summaries)
+            sweep_rows.extend(retriever_sweep)
 
-    summary = pd.DataFrame(summaries)
-    summary_path = output_dir / "retrieval_summary.csv"
-    summary.to_csv(summary_path, index=False)
+        summary = pd.DataFrame(summaries)
+        # Unsuffixed columns follow relevance_column (analysis.py reads these).
+        chosen = "_target" if relevance_column == "target" else "_source"
+        for metric in ("hit_at_k", "mrr_at_k", "ndcg_at_k"):
+            summary[metric] = summary[f"{metric}{chosen}"]
+        summary_path = output_dir / "retrieval_summary.csv"
+        summary.to_csv(summary_path, index=False)
+        pd.DataFrame(sweep_rows).to_csv(output_dir / "skew_sweep.csv", index=False)
 
-    config = {
-        "test_folder": str(test_folder) if test_file is None else None,
-        "test_file": str(test_file) if test_file is not None else None,
-        "retriever": retriever_to_run,
-        "dense_index": dense_index_path,
-        "sparse_index": sparse_index_path,
-        "pool_k": pool_k,
-        "final_k": final_k,
-        "relevance_column": relevance_column,
-        "positive_only": positive_only,
-        "q": q,
-    }
-    with open(output_dir / "evaluation_config.json", "w", encoding="utf-8") as file:
-        json.dump(config, file, indent=2)
+        config = {
+            "split": split,
+            "query_path": str(query_path),
+            "retriever": retriever_to_run,
+            "dense_index": dense_index_path,
+            "sparse_index": sparse_index_path,
+            "dense_model_name": dense_model_name,
+            "pool_k": pool_k,
+            "final_k": final_k,
+            "relevance_column": relevance_column,
+            "positive_only": positive_only,
+            "max_rows_per_file": max_rows_per_file,
+            "skew_epsilon": skew_epsilon,
+            "q": q,
+        }
+        with open(output_dir / "evaluation_config.json", "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=2)
 
-    display_columns = [
-        "retriever",
-        "reranker",
-        "hit_at_k",
-        "mrr_at_k",
-        "ndcg_at_k",
-        "mean_ndkl",
-        "mean_min_skew",
-        "mean_max_skew",
-        "exposure_group_Male",
-        "exposure_group_Female",
-    ]
-    display_columns = [column for column in display_columns if column in summary.columns]
+        suffix = "_target" if relevance_column == "target" else "_source"
+        other = "_source" if suffix == "_target" else "_target"
 
-    print()
-    print("Vanilla versus FGR")
-    print()
-    print(summary[display_columns].to_string(index=False))
-    print()
-    print(f"Saved results to: {summary_path.resolve()}")
+        print()
+        print(f"[{split}] Results, relevance = {relevance_column}")
+        print_summary(summary, suffix)
+        print()
+        print(f"[{split}] Utility under the other relevance definition")
+        print_summary(summary, other)
+        if split == "test":
+            print()
+            print("Paper, Table 1")
+            print_paper_table(summary)
+        print()
+        print(f"Saved results to: {summary_path.resolve()}")
 
-    return summary
+        summaries_by_split[split] = summary
+
+    return summaries_by_split
 
 
 if __name__ == "__main__":
